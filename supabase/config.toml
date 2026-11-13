@@ -1,0 +1,8 @@
+[functions.paystack-webhook]
+verify_jwt = false
+
+[functions.signature-webhook]
+verify_jwt = false
+
+[functions.activate-tenancies]
+verify_jwt = false

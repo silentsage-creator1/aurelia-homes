@@ -1,0 +1,6 @@
+{
+  "name": "Aurelia Homes",
+  "description": "Premium real estate platform featuring verified property listings, interactive map search, viewing bookings, mortgage calculators, and curated agent advisory.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
