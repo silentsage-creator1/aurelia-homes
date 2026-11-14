@@ -31,6 +31,19 @@ const databaseConfig = {
 const databaseConfigured = Boolean(databaseConfig.database && databaseConfig.user && databaseConfig.password);
 const pool = databaseConfigured ? new Pool(databaseConfig) : null;
 
+// An idle-client error with no listener crashes Node, which shows up as a 502.
+pool?.on('error', (error) => console.error('Postgres pool error:', error?.code || error?.message));
+// Last line of defence: log instead of dying so the proxy never sees a dead app.
+process.on('unhandledRejection', (reason) => console.error('Unhandled rejection:', reason));
+process.on('uncaughtException', (error) => console.error('Uncaught exception:', error));
+
+if (!databaseConfigured) {
+  console.error('DB_NAME, DB_USER and DB_PASSWORD are not all set. Check the environment variables in cPanel.');
+}
+
+// Express 4 does not catch errors thrown in async handlers. This wrapper does.
+const safe = (handler) => (req, res, next) => Promise.resolve(handler(req, res, next)).catch(next);
+
 app.disable('x-powered-by');
 const corsOptions = {
   origin(origin, callback) {
@@ -145,7 +158,7 @@ async function authenticate(req, res, next) {
   }
 }
 
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', safe(async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database is not configured' });
   const email = normalizeEmail(req.body?.email);
   const fullName = String(req.body?.fullName || '').trim();
@@ -154,9 +167,10 @@ app.post('/api/auth/register', async (req, res) => {
   if (!email || !email.includes('@') || !fullName || password.length < 8) {
     return res.status(400).json({ error: 'Enter a valid email, your full name, and a password of at least 8 characters.' });
   }
-  const client = await pool.connect();
+  let client;
   const accountId = randomUUID();
   try {
+    client = await pool.connect();
     await client.query('begin');
     await client.query(
       `insert into public.accounts (id,email,password_hash,status) values ($1,$2,$3,'active')`,
@@ -172,11 +186,15 @@ app.post('/api/auth/register', async (req, res) => {
     const user = await getAccountProfile(accountId);
     return res.status(201).json({ ...session, user: { id: accountId, email, user_metadata: { full_name: fullName, phone } }, profile: user });
   } catch (error) {
-    await client.query('rollback').catch(() => {});
+    await client?.query('rollback').catch(() => {});
     if (error?.code === '23505') return res.status(409).json({ error: 'An account with this email already exists.' });
+    console.error('Register failed:', error?.code, error?.message);
+    if (!client || ['ECONNREFUSED', 'ETIMEDOUT', 'ENOTFOUND', '28P01', '3D000', '57P03'].includes(error?.code) || /timeout|terminated/i.test(error?.message || '')) {
+      return res.status(503).json({ error: 'The database is unavailable right now. Please try again shortly.' });
+    }
     return res.status(500).json({ error: 'Could not create your account.' });
-  } finally { client.release(); }
-});
+  } finally { client?.release(); }
+}));
 
 app.post('/api/auth/login', async (req, res) => {
   if (!pool) return res.status(503).json({ error: 'Database is not configured' });
@@ -223,15 +241,15 @@ app.post('/api/auth/refresh', async (req, res) => {
   } catch { return res.status(503).json({ error: 'Could not refresh your session.' }); }
 });
 
-app.get('/api/auth/me', authenticate, async (req, res) => {
+app.get('/api/auth/me', authenticate, safe(async (req, res) => {
   const profile = await getAccountProfile(req.auth.account_id);
   return profile ? res.json(profile) : res.status(404).json({ error: 'Account profile not found.' });
-});
+}));
 
-app.post('/api/auth/logout', authenticate, async (req, res) => {
+app.post('/api/auth/logout', authenticate, safe(async (req, res) => {
   await pool.query('update public.auth_sessions set revoked_at=now() where id=$1', [req.auth.session_id]);
   return res.status(204).end();
-});
+}));
 
 // Read APIs use fixed table/column allowlists and server-derived ownership
 // predicates. User supplied identifiers are never interpolated unchecked.
@@ -287,7 +305,7 @@ function ownerForApplication(self) { return `exists(select 1 from public.rental_
 function mapTenancyFromAgreement(appAccess, self) { return `exists(select 1 from public.rental_agreements g where g.id=m.agreement_id and ${appAccess.replace('%s','g.application_id')})`; }
 function managerPropertyFromTenancy(tenancyColumn, self) { return `exists(select 1 from public.tenancies tx where tx.id=${tenancyColumn} and exists(select 1 from public.property_manager_assignments ma where ma.property_id=tx.property_id and ma.manager_id=${self} and ma.status='active'))`; }
 
-app.get('/api/data/:table', authenticate, async (req, res) => {
+app.get('/api/data/:table', authenticate, safe(async (req, res) => {
   const table = req.params.table;
   const columns = DATA_TABLES[table];
   if (!columns) return res.status(404).json({ error: 'Unknown data resource' });
@@ -319,17 +337,18 @@ app.get('/api/data/:table', authenticate, async (req, res) => {
     const result = await pool.query(`select ${selected.map((column) => wantsProperty ? `rental_listings.${ident(column)}` : ident(column)).join(',')}${propertyProjection} from ${source} where ${clauses.join(' and ')}${order} limit $${params.length-1} offset $${params.length}`, params);
     return res.json(result.rows);
   } catch (error) { console.error('Namecheap data read failed', table, error?.code); return res.status(500).json({ error: 'Could not load this data.' }); }
-});
+}));
 
 async function hasRole(accountId, roles) {
   const result = await pool.query(`select 1 from public.profile_roles where profile_id=$1 and role::text=any($2::text[]) limit 1`, [accountId, roles]);
   return Boolean(result.rowCount);
 }
-app.post('/api/workflows/:name', authenticate, async (req, res) => {
+app.post('/api/workflows/:name', authenticate, safe(async (req, res) => {
   const actor = req.auth.account_id;
   const input = req.body || {};
-  const client = await pool.connect();
+  let client;
   try {
+    client = await pool.connect();
     await client.query('begin');
     if (req.params.name === 'submit-rental-application') {
       const listingId = String(input.listingId || '');
@@ -359,11 +378,12 @@ app.post('/api/workflows/:name', authenticate, async (req, res) => {
     }
     throw Object.assign(new Error('This workflow is not available on the Namecheap API yet.'), { status: 501 });
   } catch (error) {
-    await client.query('rollback').catch(() => {});
+    await client?.query('rollback').catch(() => {});
     if (error?.code === '23505') return res.status(409).json({ error: 'An active application or agreement already exists.' });
+    if (!error.status) console.error('Workflow failed:', req.params.name, error?.code, error?.message);
     return res.status(error.status || 500).json({ error: error.status ? error.message : 'The workflow could not be completed.' });
-  } finally { client.release(); }
-});
+  } finally { client?.release(); }
+}));
 
 app.get(/^\/(?:[^/]+\/?)?$/, async (_req, res) => {
   if (!pool) return res.status(503).json({ service: 'Aurelia Homes API', status: 'not_configured', database: 'not_configured' });
@@ -388,6 +408,14 @@ app.get(/\/api\/health\/?$/, async (_req, res) => {
 app.use((req, res) => {
   if (/\/api(?:\/|$)/.test(req.path)) return res.status(404).json({ error: 'API route not implemented' });
   return res.status(404).json({ error: 'Route not found' });
+});
+
+app.use((error, _req, res, _next) => {
+  if (error?.message === 'Origin not allowed by CORS') {
+    return res.status(403).json({ error: 'This website is not allowed to call the API. Add its address to APP_ORIGINS.' });
+  }
+  console.error('Unhandled route error:', error?.code, error?.message);
+  return res.status(500).json({ error: 'Something went wrong on the server.' });
 });
 
 // Passenger supplies the port and socket for cPanel Node.js applications.
